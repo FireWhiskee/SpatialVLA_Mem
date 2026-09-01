@@ -39,6 +39,12 @@ class SpatialVLAConfig(PretrainedConfig):
         ego3d_patch_reso=4,
         n_freqs=8,
         use_vision_zoe=True,
+        use_memory=False,
+        memory_write_tokens=4,
+        memory_bank_size=64,
+        memory_retrieve_tokens=8,
+        memory_num_heads=8,
+        memory_dropout=0.0,
         **kwargs,
     ):
         self._ignore_index = ignore_index
@@ -98,6 +104,12 @@ class SpatialVLAConfig(PretrainedConfig):
         self.ego3d_patch_reso = ego3d_patch_reso
         self.n_freqs = n_freqs
         self.use_vision_zoe = use_vision_zoe
+        self.use_memory = use_memory
+        self.memory_write_tokens = memory_write_tokens
+        self.memory_bank_size = memory_bank_size
+        self.memory_retrieve_tokens = memory_retrieve_tokens
+        self.memory_num_heads = memory_num_heads
+        self.memory_dropout = memory_dropout
 
         super().__init__(**kwargs)
 

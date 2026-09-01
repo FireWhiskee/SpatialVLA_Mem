@@ -117,6 +117,7 @@ class SpatialVLACausalLMOutputWithPast(ModelOutput):
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     image_hidden_states: Optional[torch.FloatTensor] = None
+    memory_state: Optional[dict] = None
 
 class SpatialVLAMultiModalProjector(nn.Module):
     def __init__(self, config: SpatialVLAConfig):
@@ -126,6 +127,112 @@ class SpatialVLAMultiModalProjector(nn.Module):
     def forward(self, image_features):
         hidden_states = self.linear(image_features)
         return hidden_states
+
+class SpatialVLAFIFOMemoryAdapter(nn.Module):
+    """Minimal visual memory bank with learned compression, top-k retrieval, and gated residual fusion."""
+
+    def __init__(self, config: SpatialVLAConfig):
+        super().__init__()
+        hidden_size = config.text_config.hidden_size
+        self.write_tokens = config.memory_write_tokens
+        self.bank_size = config.memory_bank_size
+        self.retrieve_tokens = min(config.memory_retrieve_tokens, config.memory_bank_size)
+
+        self.memory_queries = nn.Parameter(torch.empty(self.write_tokens, hidden_size))
+        self.compressor = nn.MultiheadAttention(
+            hidden_size,
+            config.memory_num_heads,
+            dropout=config.memory_dropout,
+            batch_first=True,
+        )
+        self.fusion = nn.MultiheadAttention(
+            hidden_size,
+            config.memory_num_heads,
+            dropout=config.memory_dropout,
+            batch_first=True,
+        )
+        self.compressor_norm = nn.LayerNorm(hidden_size)
+        self.memory_norm = nn.LayerNorm(hidden_size)
+        self.fusion_norm = nn.LayerNorm(hidden_size)
+        self.alpha = nn.Parameter(torch.zeros(1))
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        nn.init.normal_(self.memory_queries, mean=0.0, std=0.02)
+
+    def init_memory(
+        self,
+        batch_size: int,
+        *,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> dict:
+        return {
+            "tokens": torch.zeros(batch_size, self.bank_size, self.memory_queries.shape[-1], device=device, dtype=dtype),
+            "mask": torch.zeros(batch_size, self.bank_size, device=device, dtype=torch.bool),
+        }
+
+    def _coerce_memory(self, memory_state: Optional[dict], current_tokens: torch.Tensor) -> dict:
+        batch_size, _, hidden_size = current_tokens.shape
+        if memory_state is None:
+            return self.init_memory(batch_size, device=current_tokens.device, dtype=current_tokens.dtype)
+
+        tokens = memory_state["tokens"].to(device=current_tokens.device, dtype=current_tokens.dtype)
+        mask = memory_state["mask"].to(device=current_tokens.device, dtype=torch.bool)
+        if tokens.shape[0] != batch_size or tokens.shape[1] != self.bank_size or tokens.shape[2] != hidden_size:
+            raise ValueError(
+                "memory_state has incompatible shape. Expected "
+                f"({batch_size}, {self.bank_size}, {hidden_size}), got {tuple(tokens.shape)}."
+            )
+        return {"tokens": tokens, "mask": mask}
+
+    def compress(self, current_tokens: torch.Tensor) -> torch.Tensor:
+        queries = self.memory_queries.to(dtype=current_tokens.dtype, device=current_tokens.device)
+        queries = queries.unsqueeze(0).expand(current_tokens.shape[0], -1, -1)
+        compressed, _ = self.compressor(queries, current_tokens, current_tokens, need_weights=False)
+        return self.compressor_norm(compressed)
+
+    def retrieve(self, current_tokens: torch.Tensor, memory_state: dict) -> torch.Tensor:
+        memory_tokens, memory_mask = memory_state["tokens"], memory_state["mask"]
+        query = F.normalize(current_tokens.mean(dim=1), dim=-1)
+        keys = F.normalize(memory_tokens, dim=-1)
+        scores = torch.einsum("bd,bkd->bk", query, keys)
+        scores = scores.masked_fill(~memory_mask, torch.finfo(scores.dtype).min)
+        topk = min(self.retrieve_tokens, memory_tokens.shape[1])
+        top_scores, top_idx = torch.topk(scores, k=topk, dim=1)
+        gather_idx = top_idx.unsqueeze(-1).expand(-1, -1, memory_tokens.shape[-1])
+        retrieved = memory_tokens.gather(dim=1, index=gather_idx)
+        retrieved = retrieved.masked_fill(torch.isneginf(top_scores).unsqueeze(-1), 0.0)
+        return self.memory_norm(retrieved)
+
+    def write(self, memory_state: dict, candidates: torch.Tensor, update_mask: Optional[torch.Tensor] = None) -> dict:
+        tokens, mask = memory_state["tokens"], memory_state["mask"]
+        new_tokens = torch.cat([tokens[:, self.write_tokens :], candidates], dim=1)
+        new_mask = torch.cat([mask[:, self.write_tokens :], torch.ones_like(mask[:, : self.write_tokens])], dim=1)
+
+        if update_mask is not None:
+            update_mask = update_mask.to(device=tokens.device, dtype=torch.bool).view(-1, 1, 1)
+            new_tokens = torch.where(update_mask, new_tokens, tokens)
+            new_mask = torch.where(update_mask.squeeze(-1), new_mask, mask)
+
+        return {"tokens": new_tokens, "mask": new_mask}
+
+    def forward(
+        self,
+        current_tokens: torch.Tensor,
+        memory_state: Optional[dict] = None,
+        update_memory: bool = True,
+        update_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, dict]:
+        memory_state = self._coerce_memory(memory_state, current_tokens)
+        retrieved = self.retrieve(current_tokens, memory_state)
+        history, _ = self.fusion(current_tokens, retrieved, retrieved, need_weights=False)
+        fused_tokens = current_tokens + self.alpha.to(dtype=current_tokens.dtype) * self.fusion_norm(history)
+
+        if update_memory:
+            candidates = self.compress(current_tokens.detach())
+            memory_state = self.write(memory_state, candidates, update_mask=update_mask)
+        return fused_tokens, memory_state
 
 class SpatialVLAPreTrainedModel(PreTrainedModel):
     config_class = SpatialVLAConfig
@@ -189,6 +296,7 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
             self.spatial_embed_tokens = nn.Embedding(self.config.spatial_token_num, config.text_config.hidden_size)
         else:
             self.spatial_embed_tokens = None
+        self.memory_adapter = SpatialVLAFIFOMemoryAdapter(config) if config.use_memory else None
         self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
 
 
@@ -332,7 +440,18 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
         image_features = image_features / (self.config.text_config.hidden_size**0.5)
         return image_features
 
-    def forward(
+    def init_memory(
+        self,
+        batch_size: int,
+        *,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Optional[dict]:
+        if self.memory_adapter is None:
+            return None
+        return self.memory_adapter.init_memory(batch_size, device=device or self.device, dtype=dtype)
+
+    def _forward_single(
         self,
         input_ids: torch.LongTensor = None,
         pixel_values: torch.FloatTensor = None,
@@ -350,6 +469,9 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         num_logits_to_keep: int = 0,
+        memory_state: Optional[dict] = None,
+        update_memory: bool = True,
+        memory_update_mask: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, SpatialVLACausalLMOutputWithPast]:
 
         output_attentions = output_attentions or self.config.output_attentions
@@ -371,9 +493,16 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0) + 1  # Paligemma positions are 1-indexed
 
-        # merge
+        image_features = None
         if pixel_values is not None:
             image_features = self.get_image_features(pixel_values, intrinsic)
+            if self.memory_adapter is not None:
+                image_features, memory_state = self.memory_adapter(
+                    image_features,
+                    memory_state=memory_state,
+                    update_memory=update_memory,
+                    update_mask=memory_update_mask,
+                )
             special_image_mask = (input_ids == self.config.image_token_index).unsqueeze(-1)
             special_image_mask = special_image_mask.expand_as(inputs_embeds).to(inputs_embeds.device)
             if inputs_embeds[special_image_mask].numel() != image_features.numel():
@@ -386,7 +515,6 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
             image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
 
-        # mask out pad-token-ids in labels for BC
         if labels is not None and self.pad_token_id in labels:
             logger.warning_once(
                 "`labels` contains `pad_token_id` which will be masked with `config.ignore_index`. ",
@@ -439,6 +567,138 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             image_hidden_states=image_features if pixel_values is not None else None,
+            memory_state=memory_state,
+        )
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        pixel_values: torch.FloatTensor = None,
+        actions: Optional[torch.FloatTensor] = None,
+        intrinsic: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[List[torch.FloatTensor], Cache]] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        num_logits_to_keep: int = 0,
+        memory_state: Optional[dict] = None,
+        update_memory: bool = True,
+        memory_update_mask: Optional[torch.Tensor] = None,
+    ) -> Union[Tuple, SpatialVLACausalLMOutputWithPast]:
+        if pixel_values is not None and pixel_values.dim() == 5:
+            return self._forward_temporal(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                actions=actions,
+                intrinsic=intrinsic,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                token_type_ids=token_type_ids,
+                cache_position=cache_position,
+                inputs_embeds=inputs_embeds,
+                labels=labels,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                num_logits_to_keep=num_logits_to_keep,
+                memory_state=memory_state,
+                update_memory=update_memory,
+                memory_update_mask=memory_update_mask,
+            )
+        return self._forward_single(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            actions=actions,
+            intrinsic=intrinsic,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            token_type_ids=token_type_ids,
+            cache_position=cache_position,
+            inputs_embeds=inputs_embeds,
+            labels=labels,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            num_logits_to_keep=num_logits_to_keep,
+            memory_state=memory_state,
+            update_memory=update_memory,
+            memory_update_mask=memory_update_mask,
+        )
+
+    def _forward_temporal(self, **kwargs) -> SpatialVLACausalLMOutputWithPast:
+        pixel_values = kwargs.pop("pixel_values")
+        batch_size, timesteps = pixel_values.shape[:2]
+        memory_state = kwargs.pop("memory_state")
+        update_memory = kwargs.pop("update_memory")
+        memory_update_mask = kwargs.pop("memory_update_mask")
+        return_dict = kwargs.get("return_dict")
+        return_dict = return_dict or self.config.use_return_dict
+        if not return_dict:
+            raise ValueError("Temporal memory training requires return_dict=True.")
+
+        if self.memory_adapter is not None and memory_state is None:
+            memory_state = self.init_memory(batch_size, device=pixel_values.device, dtype=pixel_values.dtype)
+
+        logits, image_hidden_states = [], []
+        labels = kwargs.get("labels")
+        intrinsic = kwargs.get("intrinsic")
+        for t in range(timesteps):
+            step_kwargs = {}
+            for key, value in kwargs.items():
+                if key == "intrinsic":
+                    continue
+                if value is not None and isinstance(value, torch.Tensor) and value.shape[:2] == (batch_size, timesteps):
+                    step_kwargs[key] = value[:, t]
+                else:
+                    step_kwargs[key] = value
+            step_kwargs["labels"] = None
+            step_intrinsic = intrinsic[:, t] if isinstance(intrinsic, torch.Tensor) and intrinsic.dim() == 4 else intrinsic
+            step_update_mask = memory_update_mask[:, t] if isinstance(memory_update_mask, torch.Tensor) and memory_update_mask.dim() == 2 else None
+            step_outputs = self._forward_single(
+                **step_kwargs,
+                pixel_values=pixel_values[:, t],
+                intrinsic=step_intrinsic,
+                memory_state=memory_state,
+                update_memory=update_memory,
+                memory_update_mask=step_update_mask,
+            )
+            memory_state = step_outputs.memory_state
+            logits.append(step_outputs.logits)
+            image_hidden_states.append(step_outputs.image_hidden_states)
+
+        logits = torch.stack(logits, dim=1)
+        loss = None
+        if labels is not None:
+            temporal_attention_mask = kwargs.get("attention_mask")
+            shift_logits = logits[..., :-1, :].float()
+            shift_labels = labels[..., 1:]
+            if temporal_attention_mask is not None:
+                shift_attention_mask = temporal_attention_mask[..., -shift_logits.shape[-2] :].to(logits.device)
+                shift_logits = shift_logits[shift_attention_mask.to(logits.device) != 0].contiguous()
+                shift_labels = shift_labels[shift_attention_mask.to(shift_labels.device) != 0].contiguous()
+            else:
+                shift_logits = shift_logits.contiguous()
+                shift_labels = shift_labels.contiguous()
+            loss_fct = nn.CrossEntropyLoss()
+            flat_logits = shift_logits.view(-1, self.config.text_config.vocab_size)
+            flat_labels = shift_labels.view(-1).to(shift_logits.device)
+            loss = loss_fct(flat_logits, flat_labels)
+        return SpatialVLACausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            image_hidden_states=torch.stack(image_hidden_states, dim=1) if image_hidden_states[0] is not None else None,
+            memory_state=memory_state,
         )
 
     # AR inference
@@ -451,6 +711,8 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
         position_ids=None,
         pixel_values=None,
         intrinsic=None,
+        memory_state=None,
+        update_memory=True,
         attention_mask=None,
         token_type_ids=None,
         use_cache=True,
@@ -474,6 +736,8 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
             model_inputs["position_ids"] += 1
         if cache_position[0] == 0:
             model_inputs["pixel_values"] = pixel_values
+            model_inputs["memory_state"] = memory_state
+            model_inputs["update_memory"] = update_memory
         is_training = token_type_ids is not None and labels is not None
         if cache_position[0] == 0 and isinstance(past_key_values, HybridCache):
             causal_mask = self._update_causal_mask(attention_mask, token_type_ids, past_key_values, cache_position, input_ids, inputs_embeds, is_training)
@@ -485,11 +749,31 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
     def predict_action(
         self,
         model_inputs,
+        memory_state: Optional[dict] = None,
+        return_memory_state: bool = False,
     ) -> torch.Tensor:
         model_inputs = model_inputs.to(torch.bfloat16).to(self.device)
         input_len = model_inputs["input_ids"].shape[-1]
-        generation_outputs = self.generate(**model_inputs, max_new_tokens=256, do_sample=False)
-        return generation_outputs[:,input_len:]
+        generation_outputs = self.generate(
+            **model_inputs,
+            memory_state=memory_state,
+            update_memory=False,
+            max_new_tokens=256,
+            do_sample=False,
+        )
+        action_tokens = generation_outputs[:,input_len:]
+        if not return_memory_state or self.memory_adapter is None:
+            return action_tokens
+        with torch.no_grad():
+            image_features = self.get_image_features(model_inputs["pixel_values"], model_inputs.get("intrinsic"))
+            _, memory_state = self.memory_adapter(image_features, memory_state=memory_state, update_memory=True)
+        return action_tokens, memory_state
+
+    @torch.no_grad()
+    def step(self, model_inputs, memory_state: Optional[dict] = None):
+        if memory_state is None:
+            memory_state = self.init_memory(model_inputs["input_ids"].shape[0], device=self.device, dtype=torch.bfloat16)
+        return self.predict_action(model_inputs, memory_state=memory_state, return_memory_state=True)
 
     @classmethod
     def from_pretrained(

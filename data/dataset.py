@@ -30,6 +30,7 @@ class OpenXIterableDataset(IterableDataset):
         obs_backward_steps=0,
         obs_backward_delta=1,
         action_forward_steps=0,
+        memory_train_window=1,
         use_raw_dataloader=False,
         fix_raw_length=None,
         vla_processor=None,
@@ -42,6 +43,7 @@ class OpenXIterableDataset(IterableDataset):
         self.image_size = image_size
         self.max_length = max_length
         self.is_train = is_train
+        self.memory_train_window = memory_train_window
 
         self.total_ranks = torch.distributed.get_world_size()
         self.current_rank = torch.distributed.get_rank()
@@ -129,6 +131,36 @@ class OpenXIterableDataset(IterableDataset):
         actions = torch.from_numpy(data_item["action"])  # (t e)
         lang = data_item["task"]["language_instruction"].lower()
         if isinstance(lang, bytes): lang = lang.decode()
+
+        if self.memory_train_window > 1:
+            actions = torch.from_numpy(data_item.get("action_history", data_item["action"]))
+            valid_mask = torch.from_numpy(data_item["observation"]["pad_mask"]).bool()
+            step_inputs = []
+            for image, action in zip(pixel_values_seq, actions):
+                step_inputs.append(
+                    self.vla_processor(
+                        text=lang,
+                        images=image,
+                        suffix_actions=action.unsqueeze(0),
+                        return_tensors="pt",
+                        padding=False,
+                        max_length=self.max_length,
+                        truncation=True,
+                        do_normalize=False,
+                    )
+                )
+            labels = torch.stack([ret["labels"][0] for ret in step_inputs])
+            labels = labels.masked_fill(~valid_mask[:, None], IGNORE_INDEX)
+            return dict(
+                input_ids=torch.stack([ret["input_ids"][0] for ret in step_inputs]),
+                labels=labels,
+                token_type_ids=torch.stack([ret["token_type_ids"][0] for ret in step_inputs]),
+                attention_mask=torch.stack([ret["attention_mask"][0] for ret in step_inputs]),
+                pixel_values=torch.stack([ret["pixel_values"][0] for ret in step_inputs]),
+                intrinsic=torch.stack([ret["intrinsic"] for ret in step_inputs]),
+                actions=actions,
+                memory_update_mask=valid_mask,
+            )
         
         # TODO: move to processor
         ret = self.vla_processor(
@@ -186,9 +218,10 @@ def build_datasets(
         shuffle_buffer_size=data_args.shuffle_buffer_size,
         tsfm_thread_muti=data_args.tsfm_thread_muti,
         read_thread_muti=data_args.read_thread_muti,
-        obs_backward_steps=data_args.obs_backward_steps,
+        obs_backward_steps=max(data_args.obs_backward_steps, data_args.memory_train_window - 1),
         obs_backward_delta=data_args.obs_backward_delta,
         action_forward_steps=data_args.action_forward_steps,
+        memory_train_window=data_args.memory_train_window,
         use_raw_dataloader=data_args.use_raw_dataloader,
         fix_raw_length=data_args.fix_raw_length,
         vla_processor=vla_processor,

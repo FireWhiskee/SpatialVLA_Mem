@@ -70,7 +70,7 @@ class ModelArguments:
     )
     lora_target: Optional[str] = field(
         default="linear",
-        metadata={"help": "Set the LoRA adapter rank for the LLM. Default is linear."},
+        metadata={"help": "Set LoRA target modules. Use llm_linear for memory fine-tuning."},
     )
     modules_to_save: Optional[str] = field(
         default=None,
@@ -95,6 +95,26 @@ class ModelArguments:
     min_sigma: float = field(
         default=0.0,
         metadata={"help": "Set the minimum sigma for creating action grids."},
+    )
+    use_memory: bool = field(
+        default=False,
+        metadata={"help": "Enable FIFO visual memory before PaLiGemma."},
+    )
+    memory_write_tokens: int = field(
+        default=4,
+        metadata={"help": "Number of compressed tokens written per frame."},
+    )
+    memory_bank_size: int = field(
+        default=64,
+        metadata={"help": "Maximum FIFO memory bank tokens per episode/window."},
+    )
+    memory_retrieve_tokens: int = field(
+        default=8,
+        metadata={"help": "Number of memory tokens retrieved per frame."},
+    )
+    memory_num_heads: int = field(
+        default=8,
+        metadata={"help": "Attention heads in the memory adapter."},
     )
 
 @dataclass
@@ -142,6 +162,10 @@ class DataTrainingArguments:
     )
     use_raw_dataloader: Optional[bool] = field(
         default=True, metadata={"help": "Whether to use raw dataloader"}
+    )
+    memory_train_window: Optional[int] = field(
+        default=1,
+        metadata={"help": "Number of consecutive frames to unroll for memory training. 1 keeps original behavior."}
     )
 
 def main():
@@ -200,6 +224,11 @@ def main():
     
     logger.info("Loading SpatialVLA Model...")
     config = SpatialVLAConfig.from_pretrained(model_args.model_name_or_path, torch_dtype=torch_dtype, local_files_only=True)
+    config.use_memory = model_args.use_memory
+    config.memory_write_tokens = model_args.memory_write_tokens
+    config.memory_bank_size = model_args.memory_bank_size
+    config.memory_retrieve_tokens = model_args.memory_retrieve_tokens
+    config.memory_num_heads = model_args.memory_num_heads
     model = SpatialVLAForConditionalGeneration.from_pretrained(
         model_args.model_name_or_path,
         config=config,
@@ -260,8 +289,15 @@ def main():
     _freeze_params(model.vision_zoe_model)
 
     if model_args.lora:
+        if model_args.use_memory and model_args.lora_target == "linear":
+            model_args.lora_target = "llm_linear"
+            logger.info("Memory fine-tuning uses PaLiGemma/Gemma LoRA only; reset lora_target to llm_linear.")
         # peft https://github.com/huggingface/peft/blob/c1fe8105a5a4a612a6178699e1def5c66c2638d2/src/peft/tuners/tuners_utils.py#L1027
-        if model_args.lora_target == "linear":
+        if model_args.lora_target == "llm_linear":
+            target_modules=[
+                "q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj",
+            ]
+        elif model_args.lora_target == "linear":
             target_modules=[
                 "q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj", # com
                 "fc1", "fc2", "out_proj", # siglip
@@ -289,6 +325,8 @@ def main():
         
         # modules_to_save: https://github.com/huggingface/peft/issues/334#issuecomment-1786449397
         modules_to_save = model_args.modules_to_save.split("+") if model_args.modules_to_save else []
+        if model_args.use_memory and "memory_adapter" not in modules_to_save:
+            modules_to_save.append("memory_adapter")
         lora_config = LoraConfig(
             r=model_args.lora,
             lora_alpha=model_args.lora_alpha,

@@ -22,6 +22,25 @@ def concat_pad_data_collator(features, pad_id=0):
     first = features[0]
     batch = {}
 
+    if first["input_ids"].dim() == 2:
+        batch_size = len(features)
+        timesteps = first["input_ids"].shape[0]
+        max_item_length = max(feat["input_ids"].shape[-1] for feat in features)
+        for key in ("input_ids", "labels", "token_type_ids", "attention_mask"):
+            fill_value = IGNORE_INDEX if key == "labels" else 0
+            dtype = features[0][key].dtype
+            padded = torch.full((batch_size, timesteps, max_item_length), fill_value, dtype=dtype)
+            for idx, feat in enumerate(features):
+                length = feat[key].shape[-1]
+                padded[idx, :, :length] = feat[key]
+            if key == "attention_mask":
+                padded = padded.bool()
+            batch[key] = padded
+        for key in ("pixel_values", "intrinsic", "actions", "memory_update_mask"):
+            if key in first and first[key] is not None:
+                batch[key] = torch.stack([feat[key] for feat in features])
+        return batch
+
     batch_lens = [feat['input_ids'].shape for feat in features]
     max_item_length = max(batch_lens)[0]
     for idx in range(len(features)):
@@ -265,8 +284,11 @@ def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=N
         loss *= self.accelerator.num_processes
 
     with torch.no_grad():
-        logits = outputs["logits"]  # (bs, seq, voc)
-        labels = inputs["labels"]  # (bs, seq)
+        logits = outputs["logits"]  # (bs, seq, voc) or (bs, t, seq, voc)
+        labels = inputs["labels"]  # (bs, seq) or (bs, t, seq)
+        if logits.dim() == 4:
+            logits = logits.flatten(0, 1)
+            labels = labels.flatten(0, 1)
         shift_logits = logits[..., :-1, :].argmax(-1).contiguous()
         shift_labels = labels[..., 1:].contiguous()
 
@@ -309,7 +331,10 @@ def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=N
         gripper_action_accuracy = gripper_correct_preds.sum().float() / gripper_mask.sum().float()
 
         # convert to continue actions
-        gt_actions = inputs["actions"].reshape(-1, 7).to(device="cpu", dtype=torch.float32)
+        actions = inputs["actions"]
+        if actions.dim() == 3 and "memory_update_mask" in inputs:
+            actions = actions[inputs["memory_update_mask"].bool()]
+        gt_actions = actions.reshape(-1, 7).to(device="cpu", dtype=torch.float32)
         pred_actions = model.action_tokenizer.decode_token_ids_to_actions(pred_action_ids.cpu().numpy().reshape(-1, 3))
         l1_loss = nn.functional.l1_loss(torch.tensor(pred_actions), torch.tensor(gt_actions))
 
