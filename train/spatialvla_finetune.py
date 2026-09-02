@@ -13,7 +13,8 @@ from train.monkey_patch import (
     replace_compute_loss,
     concat_pad_data_collator,
     replace_train_sampler,
-    SaveProcessorCallback
+    SaveProcessorCallback,
+    JsonlMetricsCallback,
 )
 import transformers
 from transformers import (
@@ -115,6 +116,14 @@ class ModelArguments:
     memory_num_heads: int = field(
         default=8,
         metadata={"help": "Attention heads in the memory adapter."},
+    )
+    memory_alpha_init: float = field(
+        default=0.0,
+        metadata={"help": "Initial residual gate value for memory fusion."},
+    )
+    memory_detach_write: bool = field(
+        default=True,
+        metadata={"help": "Detach current image tokens before writing compressed memory."},
     )
 
 @dataclass
@@ -229,6 +238,8 @@ def main():
     config.memory_bank_size = model_args.memory_bank_size
     config.memory_retrieve_tokens = model_args.memory_retrieve_tokens
     config.memory_num_heads = model_args.memory_num_heads
+    config.memory_alpha_init = model_args.memory_alpha_init
+    config.memory_detach_write = model_args.memory_detach_write
     model = SpatialVLAForConditionalGeneration.from_pretrained(
         model_args.model_name_or_path,
         config=config,
@@ -374,7 +385,7 @@ def main():
         eval_dataset=eval_dataset,
         tokenizer=tokenizer,
         data_collator=concat_pad_data_collator,
-        callbacks=[SaveProcessorCallback(processor=processor)],
+        callbacks=[SaveProcessorCallback(processor=processor), JsonlMetricsCallback()],
     )
 
     if training_args.do_train:

@@ -45,6 +45,8 @@ class SpatialVLAConfig(PretrainedConfig):
         memory_retrieve_tokens=8,
         memory_num_heads=8,
         memory_dropout=0.0,
+        memory_alpha_init=0.0,
+        memory_detach_write=True,
         **kwargs,
     ):
         self._ignore_index = ignore_index
@@ -110,6 +112,8 @@ class SpatialVLAConfig(PretrainedConfig):
         self.memory_retrieve_tokens = memory_retrieve_tokens
         self.memory_num_heads = memory_num_heads
         self.memory_dropout = memory_dropout
+        self.memory_alpha_init = memory_alpha_init
+        self.memory_detach_write = memory_detach_write
 
         super().__init__(**kwargs)
 

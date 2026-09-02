@@ -1,4 +1,5 @@
 import os
+import json
 import torch
 import numpy as np
 import torch.nn as nn
@@ -295,9 +296,14 @@ def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=N
         mask = (shift_labels >= model.action_tokenizer.translation_tokenizer.token_start_idx) & (
             shift_labels <= model.action_tokenizer.gripper_tokenizer.token_end_idx
         )
+        pred_action_mask = (shift_logits >= model.action_tokenizer.translation_tokenizer.token_start_idx) & (
+            shift_logits <= model.action_tokenizer.gripper_tokenizer.token_end_idx
+        )
+        action_token_count = mask.sum()
         gt_action_ids, pred_action_ids = shift_labels[mask], shift_logits[mask]
         correct_preds = gt_action_ids == pred_action_ids
-        action_accuracy = correct_preds.sum().float() / mask.sum().float()
+        action_accuracy = correct_preds.sum().float() / action_token_count.clamp_min(1).float()
+        pred_action_token_rate = pred_action_mask.float().mean()
 
         # NOTE: acc of translation, rotation and gripper
         token_start_idx, token_end_idx = (
@@ -326,27 +332,41 @@ def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=N
         rotation_correct_preds = rotation_gt_action_ids == rotation_pred_action_ids
         gripper_correct_preds = gripper_gt_action_ids == gripper_pred_action_ids
 
-        translation_action_accuracy = translation_correct_preds.sum().float() / translation_mask.sum().float()
-        rotation_action_accuracy = rotation_correct_preds.sum().float() / rotation_mask.sum().float()
-        gripper_action_accuracy = gripper_correct_preds.sum().float() / gripper_mask.sum().float()
+        translation_action_accuracy = translation_correct_preds.sum().float() / translation_mask.sum().clamp_min(1).float()
+        rotation_action_accuracy = rotation_correct_preds.sum().float() / rotation_mask.sum().clamp_min(1).float()
+        gripper_action_accuracy = gripper_correct_preds.sum().float() / gripper_mask.sum().clamp_min(1).float()
 
         # convert to continue actions
         actions = inputs["actions"]
         if actions.dim() == 3 and "memory_update_mask" in inputs:
             actions = actions[inputs["memory_update_mask"].bool()]
         gt_actions = actions.reshape(-1, 7).to(device="cpu", dtype=torch.float32)
-        pred_actions = model.action_tokenizer.decode_token_ids_to_actions(pred_action_ids.cpu().numpy().reshape(-1, 3))
-        l1_loss = nn.functional.l1_loss(torch.tensor(pred_actions), torch.tensor(gt_actions))
+        if pred_action_ids.numel() > 0:
+            pred_actions = model.action_tokenizer.decode_token_ids_to_actions(pred_action_ids.cpu().numpy().reshape(-1, 3))
+            l1_loss = nn.functional.l1_loss(torch.tensor(pred_actions), torch.tensor(gt_actions))
+        else:
+            l1_loss = torch.tensor(0.0)
 
-        self.log(
-            {
-                "accuracy": action_accuracy.item(),
-                "translation_accuracy": translation_action_accuracy.item(),
-                "rotation_accuracy": rotation_action_accuracy.item(),
-                "gripper_accuracy": gripper_action_accuracy.item(),
-                "l1_loss": l1_loss.item(),
-            }
-        )
+        unwrapped_model = self.accelerator.unwrap_model(model)
+        memory_alpha = None
+        memory_model = getattr(unwrapped_model, "memory_adapter", None)
+        if memory_model is None and hasattr(unwrapped_model, "base_model"):
+            memory_model = getattr(getattr(unwrapped_model.base_model, "model", None), "memory_adapter", None)
+        if memory_model is not None:
+            memory_alpha = memory_model.alpha.detach().float().item()
+
+        log_values = {
+            "accuracy": action_accuracy.item(),
+            "translation_accuracy": translation_action_accuracy.item(),
+            "rotation_accuracy": rotation_action_accuracy.item(),
+            "gripper_accuracy": gripper_action_accuracy.item(),
+            "l1_loss": l1_loss.item(),
+            "action_token_count": action_token_count.item(),
+            "pred_action_token_rate": pred_action_token_rate.item(),
+        }
+        if memory_alpha is not None:
+            log_values["memory_alpha"] = memory_alpha
+        self.log(log_values)
 
     return (loss, outputs) if return_outputs else loss
 
@@ -364,6 +384,19 @@ class SaveProcessorCallback(TrainerCallback):
             if state.global_step > 0:
                 output_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
             self.processor.save_pretrained(output_dir)
+
+class JsonlMetricsCallback(TrainerCallback):
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not state.is_world_process_zero or logs is None:
+            return
+        os.makedirs(args.output_dir, exist_ok=True)
+        record = {
+            "step": state.global_step,
+            "epoch": state.epoch,
+            **logs,
+        }
+        with open(os.path.join(args.output_dir, "train_metrics.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
         return control
 
 class ProfilerTrainer(Trainer):

@@ -137,6 +137,7 @@ class SpatialVLAFIFOMemoryAdapter(nn.Module):
         self.write_tokens = config.memory_write_tokens
         self.bank_size = config.memory_bank_size
         self.retrieve_tokens = min(config.memory_retrieve_tokens, config.memory_bank_size)
+        self.detach_write = config.memory_detach_write
 
         self.memory_queries = nn.Parameter(torch.empty(self.write_tokens, hidden_size))
         self.compressor = nn.MultiheadAttention(
@@ -154,7 +155,7 @@ class SpatialVLAFIFOMemoryAdapter(nn.Module):
         self.compressor_norm = nn.LayerNorm(hidden_size)
         self.memory_norm = nn.LayerNorm(hidden_size)
         self.fusion_norm = nn.LayerNorm(hidden_size)
-        self.alpha = nn.Parameter(torch.zeros(1))
+        self.alpha = nn.Parameter(torch.full((1,), float(config.memory_alpha_init)))
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -230,7 +231,8 @@ class SpatialVLAFIFOMemoryAdapter(nn.Module):
         fused_tokens = current_tokens + self.alpha.to(dtype=current_tokens.dtype) * self.fusion_norm(history)
 
         if update_memory:
-            candidates = self.compress(current_tokens.detach())
+            write_source = current_tokens.detach() if self.detach_write else current_tokens
+            candidates = self.compress(write_source)
             memory_state = self.write(memory_state, candidates, update_mask=update_mask)
         return fused_tokens, memory_state
 
@@ -642,49 +644,111 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
         memory_state = kwargs.pop("memory_state")
         update_memory = kwargs.pop("update_memory")
         memory_update_mask = kwargs.pop("memory_update_mask")
+        labels = kwargs.get("labels")
+        input_ids = kwargs.get("input_ids")
+        inputs_embeds = kwargs.get("inputs_embeds")
+        attention_mask = kwargs.get("attention_mask")
+        token_type_ids = kwargs.get("token_type_ids")
+        past_key_values = kwargs.get("past_key_values")
+        cache_position = kwargs.get("cache_position")
+        position_ids = kwargs.get("position_ids")
+        intrinsic = kwargs.get("intrinsic")
+        use_cache = kwargs.get("use_cache")
+        output_attentions = kwargs.get("output_attentions")
+        output_hidden_states = kwargs.get("output_hidden_states")
+        num_logits_to_keep = kwargs.get("num_logits_to_keep", 0)
         return_dict = kwargs.get("return_dict")
         return_dict = return_dict or self.config.use_return_dict
         if not return_dict:
             raise ValueError("Temporal memory training requires return_dict=True.")
+        if past_key_values is not None:
+            raise ValueError("Temporal memory training does not support past_key_values.")
+        if inputs_embeds is not None:
+            raise ValueError("Temporal memory training expects input_ids, not precomputed inputs_embeds.")
 
         if self.memory_adapter is not None and memory_state is None:
             memory_state = self.init_memory(batch_size, device=pixel_values.device, dtype=pixel_values.dtype)
 
-        logits, image_hidden_states = [], []
-        labels = kwargs.get("labels")
-        intrinsic = kwargs.get("intrinsic")
+        image_hidden_states = []
         for t in range(timesteps):
-            step_kwargs = {}
-            for key, value in kwargs.items():
-                if key == "intrinsic":
-                    continue
-                if value is not None and isinstance(value, torch.Tensor) and value.shape[:2] == (batch_size, timesteps):
-                    step_kwargs[key] = value[:, t]
-                else:
-                    step_kwargs[key] = value
-            step_kwargs["labels"] = None
             step_intrinsic = intrinsic[:, t] if isinstance(intrinsic, torch.Tensor) and intrinsic.dim() == 4 else intrinsic
             step_update_mask = memory_update_mask[:, t] if isinstance(memory_update_mask, torch.Tensor) and memory_update_mask.dim() == 2 else None
-            step_outputs = self._forward_single(
-                **step_kwargs,
-                pixel_values=pixel_values[:, t],
-                intrinsic=step_intrinsic,
-                memory_state=memory_state,
-                update_memory=update_memory,
-                memory_update_mask=step_update_mask,
-            )
-            memory_state = step_outputs.memory_state
-            logits.append(step_outputs.logits)
-            image_hidden_states.append(step_outputs.image_hidden_states)
+            image_features = self.get_image_features(pixel_values[:, t], step_intrinsic)
+            if self.memory_adapter is not None:
+                image_features, memory_state = self.memory_adapter(
+                    image_features,
+                    memory_state=memory_state,
+                    update_memory=update_memory,
+                    update_mask=step_update_mask,
+                )
+            image_hidden_states.append(image_features)
 
-        logits = torch.stack(logits, dim=1)
+        image_hidden_states = torch.stack(image_hidden_states, dim=1)
+        flat_input_ids = input_ids.reshape(batch_size * timesteps, -1)
+        flat_attention_mask = attention_mask.reshape(batch_size * timesteps, -1) if attention_mask is not None else None
+        flat_token_type_ids = token_type_ids.reshape(batch_size * timesteps, -1) if token_type_ids is not None else None
+        flat_labels = labels.reshape(batch_size * timesteps, -1) if labels is not None else None
+        flat_image_features = image_hidden_states.reshape(batch_size * timesteps, image_hidden_states.shape[-2], image_hidden_states.shape[-1])
+
+        inputs_embeds = self.get_input_embeddings()(flat_input_ids).clone()
+        if self.config.use_spatial_token:
+            spatial_selected = (flat_input_ids >= self.config.action_token_begin_idx) & (
+                flat_input_ids < self.config.action_token_begin_idx + self.config.spatial_token_num
+            )
+            inputs_embeds[spatial_selected] = inputs_embeds[spatial_selected] * 0.0 + self.spatial_embed_tokens(
+                flat_input_ids[spatial_selected] - self.config.action_token_begin_idx
+            )
+
+        if cache_position is None:
+            cache_position = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0) + 1
+        elif position_ids.dim() == 3:
+            position_ids = position_ids.reshape(batch_size * timesteps, -1)
+
+        special_image_mask = (flat_input_ids == self.config.image_token_index).unsqueeze(-1)
+        special_image_mask = special_image_mask.expand_as(inputs_embeds).to(inputs_embeds.device)
+        if inputs_embeds[special_image_mask].numel() != flat_image_features.numel():
+            image_tokens_in_text = torch.sum(flat_input_ids == self.config.image_token_index)
+            raise ValueError(
+                f"Number of images does not match number of special image tokens in the input text. "
+                f"Got {image_tokens_in_text} image tokens in the text but "
+                f"{flat_image_features.shape[0] * flat_image_features.shape[1]} tokens from image embeddings."
+            )
+        flat_image_features = flat_image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, flat_image_features)
+
+        if flat_labels is not None and self.pad_token_id in flat_labels:
+            logger.warning_once(
+                "`labels` contains `pad_token_id` which will be masked with `config.ignore_index`. ",
+                "You have to mask out `pad_token_id` when preparing `labels`, this behavior will be removed in v.4.46.",
+            )
+            flat_labels = torch.where(flat_input_ids == self.pad_token_id, self.config.ignore_index, flat_labels)
+
+        is_training = flat_token_type_ids is not None and flat_labels is not None
+        causal_mask = self._update_causal_mask(
+            flat_attention_mask, flat_token_type_ids, None, cache_position, flat_input_ids, inputs_embeds, is_training
+        )
+        outputs = self.language_model(
+            attention_mask=causal_mask,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
+            num_logits_to_keep=num_logits_to_keep,
+        )
+
+        logits = outputs.logits.reshape(batch_size, timesteps, outputs.logits.shape[-2], outputs.logits.shape[-1])
         loss = None
-        if labels is not None:
-            temporal_attention_mask = kwargs.get("attention_mask")
-            shift_logits = logits[..., :-1, :].float()
-            shift_labels = labels[..., 1:]
-            if temporal_attention_mask is not None:
-                shift_attention_mask = temporal_attention_mask[..., -shift_logits.shape[-2] :].to(logits.device)
+        if flat_labels is not None:
+            shift_logits = outputs.logits[..., :-1, :].float()
+            shift_labels = flat_labels[..., 1:]
+            if flat_attention_mask is not None:
+                shift_attention_mask = flat_attention_mask[:, -shift_logits.shape[1] :].to(outputs.logits.device)
                 shift_logits = shift_logits[shift_attention_mask.to(logits.device) != 0].contiguous()
                 shift_labels = shift_labels[shift_attention_mask.to(shift_labels.device) != 0].contiguous()
             else:
@@ -697,7 +761,10 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
         return SpatialVLACausalLMOutputWithPast(
             loss=loss,
             logits=logits,
-            image_hidden_states=torch.stack(image_hidden_states, dim=1) if image_hidden_states[0] is not None else None,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            image_hidden_states=image_hidden_states,
             memory_state=memory_state,
         )
 
