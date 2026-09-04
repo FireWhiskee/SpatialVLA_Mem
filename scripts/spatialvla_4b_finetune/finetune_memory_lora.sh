@@ -27,7 +27,7 @@ mixture=${mixture:-libero_10_no_noops}
 NUM_WORKERS=${NUM_WORKERS:-1}
 shuffle_buffer_size=${shuffle_buffer_size:-8192} # large buffer for better shuffling, we use 131072 in pretrain
 
-lr=${lr:-2e-4}
+lr=${lr:-1e-4}
 lora=${lora:-16}
 lora_alpha=${lora_alpha:-16}
 lora_target="linear"
@@ -40,8 +40,8 @@ MEMORY_WRITE_TOKENS=${MEMORY_WRITE_TOKENS:-4}
 MEMORY_BANK_SIZE=${MEMORY_BANK_SIZE:-64}
 MEMORY_RETRIEVE_TOKENS=${MEMORY_RETRIEVE_TOKENS:-8}
 MEMORY_NUM_HEADS=${MEMORY_NUM_HEADS:-8}
-MEMORY_ALPHA_INIT=${MEMORY_ALPHA_INIT:-0.05}
-MEMORY_DETACH_WRITE=${MEMORY_DETACH_WRITE:-False}
+MEMORY_ALPHA_INIT=${MEMORY_ALPHA_INIT:-0.01}
+MEMORY_DETACH_WRITE=${MEMORY_DETACH_WRITE:-True}
 FIX_RAW_LENGTH=${FIX_RAW_LENGTH:-2000}
 MAX_STEPS=${MAX_STEPS:-}
 
