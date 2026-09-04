@@ -121,6 +121,10 @@ class ModelArguments:
         default=0.0,
         metadata={"help": "Initial residual gate value for memory fusion."},
     )
+    memory_train_alpha: bool = field(
+        default=False,
+        metadata={"help": "Set to True to make the memory residual gate trainable."},
+    )
     memory_detach_write: bool = field(
         default=True,
         metadata={"help": "Detach current image tokens before writing compressed memory."},
@@ -239,6 +243,7 @@ def main():
     config.memory_retrieve_tokens = model_args.memory_retrieve_tokens
     config.memory_num_heads = model_args.memory_num_heads
     config.memory_alpha_init = model_args.memory_alpha_init
+    config.memory_train_alpha = model_args.memory_train_alpha
     config.memory_detach_write = model_args.memory_detach_write
     model = SpatialVLAForConditionalGeneration.from_pretrained(
         model_args.model_name_or_path,

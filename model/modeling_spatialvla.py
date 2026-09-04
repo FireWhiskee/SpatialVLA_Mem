@@ -155,7 +155,11 @@ class SpatialVLAFIFOMemoryAdapter(nn.Module):
         self.compressor_norm = nn.LayerNorm(hidden_size)
         self.memory_norm = nn.LayerNorm(hidden_size)
         self.fusion_norm = nn.LayerNorm(hidden_size)
-        self.alpha = nn.Parameter(torch.full((1,), float(config.memory_alpha_init)))
+        alpha = torch.full((1,), float(config.memory_alpha_init))
+        if config.memory_train_alpha:
+            self.alpha = nn.Parameter(alpha)
+        else:
+            self.register_buffer("alpha", alpha, persistent=True)
         self._reset_parameters()
 
     def _reset_parameters(self):

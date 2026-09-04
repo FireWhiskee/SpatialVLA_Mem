@@ -27,13 +27,15 @@ mixture=${mixture:-libero_10_no_noops}
 NUM_WORKERS=${NUM_WORKERS:-1}
 shuffle_buffer_size=${shuffle_buffer_size:-8192} # large buffer for better shuffling, we use 131072 in pretrain
 
-lr=${lr:-1e-4}
-lora=${lora:-16}
-lora_alpha=${lora_alpha:-16}
+lr=${lr:-5e-5}
+lora=${lora:-32}
+lora_alpha=${lora_alpha:-32}
 lora_target="linear"
 
 epoch=${epoch:-2}
 save_steps=${save_steps:-100}
+logging_steps=${logging_steps:-20}
+max_grad_norm=${max_grad_norm:-0.3}
 
 MEMORY_TRAIN_WINDOW=${MEMORY_TRAIN_WINDOW:-8}
 MEMORY_WRITE_TOKENS=${MEMORY_WRITE_TOKENS:-4}
@@ -41,6 +43,7 @@ MEMORY_BANK_SIZE=${MEMORY_BANK_SIZE:-64}
 MEMORY_RETRIEVE_TOKENS=${MEMORY_RETRIEVE_TOKENS:-8}
 MEMORY_NUM_HEADS=${MEMORY_NUM_HEADS:-8}
 MEMORY_ALPHA_INIT=${MEMORY_ALPHA_INIT:-0.01}
+MEMORY_TRAIN_ALPHA=${MEMORY_TRAIN_ALPHA:-False}
 MEMORY_DETACH_WRITE=${MEMORY_DETACH_WRITE:-True}
 FIX_RAW_LENGTH=${FIX_RAW_LENGTH:-2000}
 MAX_STEPS=${MAX_STEPS:-}
@@ -59,7 +62,7 @@ date_dir=$(date "+%Y-%m-%d")
 # resume training from ckpt
 model_name_or_path=/root/autodl-tmp/hf/pretrained/spatialvla-4b-224-pt
 data_root_dir=/root/autodl-tmp/data/modified_libero_rlds
-note=$(basename $model_name_or_path)_memT${MEMORY_TRAIN_WINDOW}_bank${MEMORY_BANK_SIZE}_write${MEMORY_WRITE_TOKENS}_ret${MEMORY_RETRIEVE_TOKENS}_alpha${MEMORY_ALPHA_INIT}_detach${MEMORY_DETACH_WRITE}_lr${lr}_bs${PER_DEVICE_BATCH_SIZE}_node$((GPUS / GPUS_PER_NODE))_gpu${GPUS}_r${lora}_a${lora_alpha}_ep${epoch}_${lora_target}
+note=$(basename $model_name_or_path)_memT${MEMORY_TRAIN_WINDOW}_bank${MEMORY_BANK_SIZE}_write${MEMORY_WRITE_TOKENS}_ret${MEMORY_RETRIEVE_TOKENS}_alpha${MEMORY_ALPHA_INIT}_trainalpha${MEMORY_TRAIN_ALPHA}_detach${MEMORY_DETACH_WRITE}_lr${lr}_bs${PER_DEVICE_BATCH_SIZE}_node$((GPUS / GPUS_PER_NODE))_gpu${GPUS}_r${lora}_a${lora_alpha}_ep${epoch}_${lora_target}
 OUTPUT_DIR=${resume_path:-/root/autodl-tmp/outputs/spatialvla_4b_memory_lora/$date_dir/${cur_time}_${mixture}_${note}}
 mkdir -p $OUTPUT_DIR
 
@@ -84,6 +87,7 @@ torchrun $TORCH_RUN_ARGS \
   --memory_retrieve_tokens ${MEMORY_RETRIEVE_TOKENS} \
   --memory_num_heads ${MEMORY_NUM_HEADS} \
   --memory_alpha_init ${MEMORY_ALPHA_INIT} \
+  --memory_train_alpha ${MEMORY_TRAIN_ALPHA} \
   --memory_detach_write ${MEMORY_DETACH_WRITE} \
   --lora ${lora} \
   --lora_alpha ${lora_alpha} \
@@ -113,7 +117,8 @@ torchrun $TORCH_RUN_ARGS \
   --weight_decay 0.0 \
   --warmup_ratio 0.005 \
   --lr_scheduler_type linear \
-  --logging_steps 20 \
+  --logging_steps ${logging_steps} \
+  --max_grad_norm ${max_grad_norm} \
   --do_train True \
   --grad_checkpoint True \
   --deepspeed scripts/zero1.json \

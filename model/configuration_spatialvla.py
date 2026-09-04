@@ -46,6 +46,7 @@ class SpatialVLAConfig(PretrainedConfig):
         memory_num_heads=8,
         memory_dropout=0.0,
         memory_alpha_init=0.0,
+        memory_train_alpha=False,
         memory_detach_write=True,
         **kwargs,
     ):
@@ -113,6 +114,7 @@ class SpatialVLAConfig(PretrainedConfig):
         self.memory_num_heads = memory_num_heads
         self.memory_dropout = memory_dropout
         self.memory_alpha_init = memory_alpha_init
+        self.memory_train_alpha = memory_train_alpha
         self.memory_detach_write = memory_detach_write
 
         super().__init__(**kwargs)

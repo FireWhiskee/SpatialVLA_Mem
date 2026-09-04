@@ -23,13 +23,15 @@ mixture=${mixture:-libero_10_no_noops}
 NUM_WORKERS=${NUM_WORKERS:-1}
 shuffle_buffer_size=${shuffle_buffer_size:-8192} # large buffer for better shuffling, we use 131072 in pretrain
 
-lr=${lr:-2e-4}
-lora=${lora:-16}
-lora_alpha=${lora_alpha:-16}
+lr=${lr:-5e-5}
+lora=${lora:-32}
+lora_alpha=${lora_alpha:-32}
 lora_target=${lora_target:-llm_linear}
 
 epoch=${epoch:-2}
 save_steps=${save_steps:-100}
+logging_steps=${logging_steps:-20}
+max_grad_norm=${max_grad_norm:-0.3}
 FIX_RAW_LENGTH=${FIX_RAW_LENGTH:-2000}
 MAX_STEPS=${MAX_STEPS:-}
 
@@ -94,7 +96,8 @@ torchrun $TORCH_RUN_ARGS \
   --weight_decay 0.0 \
   --warmup_ratio 0.005 \
   --lr_scheduler_type linear \
-  --logging_steps 20 \
+  --logging_steps ${logging_steps} \
+  --max_grad_norm ${max_grad_norm} \
   --do_train True \
   --grad_checkpoint True \
   --deepspeed scripts/zero1.json \
