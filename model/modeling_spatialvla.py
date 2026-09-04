@@ -228,9 +228,8 @@ class SpatialVLAFIFOMemoryAdapter(nn.Module):
         memory_state = self._coerce_memory(memory_state, current_tokens)
         retrieved = self.retrieve(current_tokens, memory_state)
         history, _ = self.fusion(current_tokens, retrieved, retrieved, need_weights=False)
-        with torch.no_grad():
-            self.alpha.nan_to_num_(0.0).clamp_(min=-1.0, max=1.0)
-        alpha = self.alpha.to(dtype=current_tokens.dtype)
+        alpha = torch.nan_to_num(self.alpha, nan=0.0, posinf=1.0, neginf=-1.0)
+        alpha = alpha.clamp(min=-1.0, max=1.0).to(dtype=current_tokens.dtype)
         fused_tokens = current_tokens + alpha * self.fusion_norm(history)
 
         if update_memory:
