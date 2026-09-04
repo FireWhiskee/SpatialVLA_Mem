@@ -199,8 +199,8 @@ class SpatialVLAFIFOMemoryAdapter(nn.Module):
 
     def retrieve(self, current_tokens: torch.Tensor, memory_state: dict) -> torch.Tensor:
         memory_tokens, memory_mask = memory_state["tokens"], memory_state["mask"]
-        query = F.normalize(current_tokens.mean(dim=1), dim=-1)
-        keys = F.normalize(memory_tokens, dim=-1)
+        query = F.normalize(current_tokens.mean(dim=1).float(), dim=-1, eps=1e-6)
+        keys = F.normalize(memory_tokens.float(), dim=-1, eps=1e-6)
         scores = torch.einsum("bd,bkd->bk", query, keys)
         scores = scores.masked_fill(~memory_mask, torch.finfo(scores.dtype).min)
         topk = min(self.retrieve_tokens, memory_tokens.shape[1])
