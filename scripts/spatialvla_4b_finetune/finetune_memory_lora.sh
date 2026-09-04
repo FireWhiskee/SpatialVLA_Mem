@@ -1,8 +1,8 @@
 set -x
 
-# Minimal FIFO-memory LoRA fine-tuning for SpatialVLA.
+# FIFO-memory LoRA fine-tuning for SpatialVLA on LIBERO-10.
 # Override variables from the shell, e.g.:
-#   mixture=libero_spatial_no_noops MEMORY_TRAIN_WINDOW=8 bash scripts/spatialvla_4b_finetune/finetune_memory_lora.sh
+#   MAX_STEPS=2 FIX_RAW_LENGTH=16 bash scripts/spatialvla_4b_finetune/finetune_memory_lora.sh
 
 DEBUG=${DEBUG:-false}
 if [ "$DEBUG" = true ]; then
@@ -27,13 +27,13 @@ mixture=${mixture:-libero_10_no_noops}
 NUM_WORKERS=${NUM_WORKERS:-1}
 shuffle_buffer_size=${shuffle_buffer_size:-8192} # large buffer for better shuffling, we use 131072 in pretrain
 
-lr=${lr:-5e-5}
+lr=${lr:-1e-4}
 lora=${lora:-32}
 lora_alpha=${lora_alpha:-32}
 lora_target="linear"
 
-epoch=${epoch:-2}
-save_steps=${save_steps:-100}
+epoch=${epoch:-5}
+save_steps=${save_steps:-1000}
 logging_steps=${logging_steps:-20}
 max_grad_norm=${max_grad_norm:-0.3}
 
@@ -45,7 +45,7 @@ MEMORY_NUM_HEADS=${MEMORY_NUM_HEADS:-8}
 MEMORY_ALPHA_INIT=${MEMORY_ALPHA_INIT:-0.01}
 MEMORY_TRAIN_ALPHA=${MEMORY_TRAIN_ALPHA:-False}
 MEMORY_DETACH_WRITE=${MEMORY_DETACH_WRITE:-True}
-FIX_RAW_LENGTH=${FIX_RAW_LENGTH:-2000}
+FIX_RAW_LENGTH=${FIX_RAW_LENGTH:-}
 MAX_STEPS=${MAX_STEPS:-}
 
 DATA_LIMIT_ARGS=""

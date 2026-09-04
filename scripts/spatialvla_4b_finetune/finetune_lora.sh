@@ -23,16 +23,16 @@ mixture=${mixture:-libero_10_no_noops}
 NUM_WORKERS=${NUM_WORKERS:-1}
 shuffle_buffer_size=${shuffle_buffer_size:-8192} # large buffer for better shuffling, we use 131072 in pretrain
 
-lr=${lr:-5e-5}
+lr=${lr:-1e-4}
 lora=${lora:-32}
 lora_alpha=${lora_alpha:-32}
 lora_target=${lora_target:-llm_linear}
 
-epoch=${epoch:-2}
-save_steps=${save_steps:-100}
+epoch=${epoch:-5}
+save_steps=${save_steps:-1000}
 logging_steps=${logging_steps:-20}
 max_grad_norm=${max_grad_norm:-0.3}
-FIX_RAW_LENGTH=${FIX_RAW_LENGTH:-2000}
+FIX_RAW_LENGTH=${FIX_RAW_LENGTH:-}
 MAX_STEPS=${MAX_STEPS:-}
 
 DATA_LIMIT_ARGS=""
